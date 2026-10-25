@@ -1746,10 +1746,11 @@ const client = new Client({
     GatewayIntentBits.GuildVoiceStates
   ],
   partials: [Partials.Channel, Partials.Message],
-  presence: { status: 'idle' }
+  presence: { status: 'online' }
 });
 
 // ── Gateway & Shard resilience listeners ──
+let gatewayRecoveryTimer = null;
 client.on(Events.Error, (err) => {
   console.error('[Discord Client Error]', err?.message || err);
 });
@@ -1757,19 +1758,29 @@ client.on(Events.ShardError, (err, shardId) => {
   console.error(`[Discord Shard ${shardId} Error]`, err?.message || err);
 });
 client.on(Events.ShardReconnecting, (shardId) => {
-  console.log(`[Discord Shard ${shardId}] Reconnecting to gateway...`);
+  console.log(`[Discord Shard ${shardId}] Reconnecting to gateway automatically...`);
 });
 client.on(Events.ShardResume, (shardId, replayedEvents) => {
+  if (gatewayRecoveryTimer) {
+    clearTimeout(gatewayRecoveryTimer);
+    gatewayRecoveryTimer = null;
+  }
   console.log(`[Discord Shard ${shardId}] Resumed connection. Replayed ${replayedEvents} events.`);
 });
 client.on(Events.ShardDisconnect, (event, shardId) => {
-  console.warn(`[Discord Shard ${shardId} Disconnected]`, event);
-  setTimeout(() => {
-    if (!client.ws || client.ws.status !== 0) {
-      console.log('[Discord Gateway] Auto-reconnecting client...');
+  console.warn(`[Discord Shard ${shardId} Disconnected] Code: ${event?.code}, Reason: ${event?.reason}`);
+  // Discord.js v14 automatically manages shard reconnection.
+  // Never call client.login() immediately; doing so triggers concurrent gateway sessions and Opcode 9 invalidations.
+  if (gatewayRecoveryTimer) clearTimeout(gatewayRecoveryTimer);
+  gatewayRecoveryTimer = setTimeout(() => {
+    // Only attempt manual intervention if Discord.js completely stalled in disconnected status after 30s
+    const status = client.ws?.status;
+    const isConnectingOrReady = [0, 1, 2, 7, 8].includes(status);
+    if (!isConnectingOrReady) {
+      console.warn(`[Discord Gateway] Connection stalled in status ${status} after 30s. Triggering safe reconnect...`);
       client.login(config.token).catch((err) => console.error('[Discord Reconnect Error]', err.message));
     }
-  }, 3000);
+  }, 30000);
 });
 client.rest.on('rateLimited', (info) => {
   console.warn('[Discord REST RateLimited]', info?.route, `retryAfter=${info?.timeToReset}ms`);
@@ -11190,6 +11201,15 @@ async function maintainLeaderLock(discordClient) {
     const lockBootTime = data.bootTime || 0;
     const heartbeatAge = now - (data.heartbeat || 0);
 
+    // If the previous leader's heartbeat expired (> 18s old), this lock is dead. Claim leadership immediately!
+    if (heartbeatAge >= 18000) {
+      console.log(`[LeaderElection] Previous leader ${data.instanceId} timed out (${heartbeatAge}ms). ${INSTANCE_ID} claiming Leader role.`);
+      await lockMsg.edit(`🤖 [LEADER_LOCK]:{"instanceId":"${INSTANCE_ID}","heartbeat":${now},"bootTime":${INSTANCE_BOOT_TIME}}`).catch(() => null);
+      isLeader = true;
+      return;
+    }
+
+    // Previous leader is actively heartbeating (< 18s ago).
     // If our boot time is NEWER than the lock's boot time, we are a newly deployed build! Take over the lock!
     if (INSTANCE_BOOT_TIME > lockBootTime + 1000) {
       console.log(`[LeaderElection] Newer deployment detected (${INSTANCE_BOOT_TIME} > ${lockBootTime}). Claiming Leader role from ${data.instanceId}.`);
@@ -11198,26 +11218,11 @@ async function maintainLeaderLock(discordClient) {
       return;
     }
 
-    // If our boot time is OLDER than the lock's boot time, enter standby instead of terminating
-    if (INSTANCE_BOOT_TIME < lockBootTime - 1000) {
-      if (isLeader) {
-        console.log(`[LeaderElection] Newer deployment detected (${INSTANCE_BOOT_TIME} < ${lockBootTime}). ${INSTANCE_ID} entering Standby mode.`);
-      }
-      isLeader = false;
-      return;
+    // Active leader is still alive and has an equal or newer deployment
+    if (isLeader) {
+      console.log(`[LeaderElection] Active leader ${data.instanceId} is running (heartbeat ${heartbeatAge}ms ago). ${INSTANCE_ID} entering Standby mode.`);
     }
-
-    // If boot times are identical or within 1s (e.g. concurrent replicas):
-    if (heartbeatAge < 18000) {
-      if (isLeader) {
-        console.log(`[LeaderElection] ${INSTANCE_ID} entering Standby mode. Active Leader is ${data.instanceId} (heartbeat ${heartbeatAge}ms ago).`);
-      }
-      isLeader = false;
-    } else {
-      console.log(`[LeaderElection] Previous leader ${data.instanceId} timed out (${heartbeatAge}ms). ${INSTANCE_ID} claiming Leader role.`);
-      await lockMsg.edit(`🤖 [LEADER_LOCK]:{"instanceId":"${INSTANCE_ID}","heartbeat":${now},"bootTime":${INSTANCE_BOOT_TIME}}`).catch(() => null);
-      isLeader = true;
-    }
+    isLeader = false;
   } catch (err) {
     console.warn('[LeaderElection] Heartbeat update error:', err.message);
   }
@@ -11225,7 +11230,7 @@ async function maintainLeaderLock(discordClient) {
 
 /**
  * Bot status: "Watching" a live count of members and ER:LC players in game.
- * Stays on the idle (yellow) presence so it never reads as plain "Online".
+ * Stays on the bright online (green) presence for 24/7 visibility.
  */
 async function updateBotPresence(botClient) {
   try {
@@ -11244,7 +11249,7 @@ async function updateBotPresence(botClient) {
 
     botClient.user?.setPresence({
       activities: [{ name: text, type: ActivityType.Watching }],
-      status: 'idle'
+      status: 'online'
     });
   } catch (err) {
     console.warn(`Could not update bot presence: ${err.message}`);
@@ -23089,8 +23094,21 @@ if (!process.env.SKIP_LOGIN) {
   // (that 2nd login is what stole your commands + froze updates).
   const entry = process.argv[1] ? path.resolve(process.argv[1]).replace(/\\/g, '/') : '';
   const self = fileURLToPath(import.meta.url).replace(/\\/g, '/');
-  if (entry.toLowerCase().endsWith('/src/index.js') && (entry.toLowerCase() === self.toLowerCase() || path.resolve(entry).toLowerCase() === path.resolve(self).toLowerCase())) {
-    client.login(config.token);
+  const isDirectEntry = !entry || entry.toLowerCase().endsWith('/src/index.js') || entry.toLowerCase() === self.toLowerCase() || path.resolve(entry).toLowerCase() === path.resolve(self).toLowerCase();
+  if (isDirectEntry) {
+    const connectDiscord = async (attempt = 1) => {
+      try {
+        console.log(`[Discord] Connecting client to gateway (attempt ${attempt})...`);
+        await client.login(config.token);
+        console.log('[Discord] Login initiated successfully.');
+      } catch (loginErr) {
+        console.error(`[Discord Login Error] (attempt ${attempt}): ${loginErr.message}`);
+        const delay = Math.min(5000 * Math.pow(1.5, attempt - 1), 30000);
+        console.log(`[Discord] Retrying login in ${Math.round(delay / 1000)}s...`);
+        setTimeout(() => connectDiscord(attempt + 1), delay);
+      }
+    };
+    connectDiscord();
 
     // Launch Orlando Roleplay bot as a completely separate background process
     try {
@@ -23102,56 +23120,58 @@ if (!process.env.SKIP_LOGIN) {
     } catch (orlErr) {
       console.warn('[Runner] Could not start orlando.js process:', orlErr.message);
     }
-  }
-}
-
-// ═════════════════════ Railway / Web Healthcheck Server ═════════════════════
-const PORT = process.env.PORT || process.env.WEB_PORT;
-if (PORT) {
-  try {
-    const healthServer = http.createServer((req, res) => {
-      if (req.url === '/health' || req.url === '/' || req.url === '/ping') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            status: 'online',
-            service: 'Alabama State Roleplay Utilities',
-            bot: client?.user?.tag || 'connecting',
-            ping: client?.ws?.ping ?? -1,
-            uptimeSec: Math.floor(process.uptime()),
-            timestamp: new Date().toISOString()
-          })
-        );
-      } else if (req.url?.startsWith('/transcripts/')) {
-        const rawFile = req.url.replace('/transcripts/', '').split('?')[0];
-        const safeFile = path.basename(rawFile);
-        const filePath = path.join(process.cwd(), 'transcripts', safeFile);
-        if (fs.existsSync(filePath)) {
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-          return fs.createReadStream(filePath).pipe(res);
+    // ═════════════════════ Railway / Web Healthcheck Server ═════════════════════
+    const PORT = process.env.PORT || process.env.WEB_PORT || 8080;
+    try {
+      const healthServer = http.createServer((req, res) => {
+        if (req.url === '/health' || req.url === '/' || req.url === '/ping') {
+          const isDiscordReady = Boolean(client?.isReady());
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-cache, no-store, must-revalidate'
+          });
+          res.end(
+            JSON.stringify({
+              status: isDiscordReady ? 'online' : 'connecting',
+              discordReady: isDiscordReady,
+              service: 'Alabama State Roleplay Utilities',
+              bot: client?.user?.tag || 'connecting',
+              ping: client?.ws?.ping ?? -1,
+              uptimeSec: Math.floor(process.uptime()),
+              timestamp: new Date().toISOString()
+            })
+          );
+        } else if (req.url?.startsWith('/transcripts/')) {
+          const rawFile = req.url.replace('/transcripts/', '').split('?')[0];
+          const safeFile = path.basename(rawFile);
+          const filePath = path.join(process.cwd(), 'transcripts', safeFile);
+          if (fs.existsSync(filePath)) {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            return fs.createReadStream(filePath).pipe(res);
+          } else {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            return res.end('Transcript not found');
+          }
         } else {
           res.writeHead(404, { 'Content-Type': 'text/plain' });
-          return res.end('Transcript not found');
+          res.end('Not Found');
         }
-      } else {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Not Found');
-      }
-    });
+      });
 
-    healthServer.on('error', (err) => {
-      if (err.code === 'EADDRINUSE') {
-        console.warn(`[Railway Web Server] Port ${PORT} is already in use by another instance. Continuing bot execution.`);
-      } else {
-        console.warn(`[Railway Web Server] Server error: ${err.message}`);
-      }
-    });
+      healthServer.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+          console.warn(`[Railway Web Server] Port ${PORT} is already in use by another instance. Continuing bot execution.`);
+        } else {
+          console.warn(`[Railway Web Server] Server error: ${err.message}`);
+        }
+      });
 
-    healthServer.listen(Number(PORT), '0.0.0.0', () => {
-      console.log(`[Railway Web Server] Healthcheck listening on port ${PORT}`);
-    });
-  } catch (srvErr) {
-    console.warn(`[Railway Web Server] Could not start health server: ${srvErr.message}`);
+      healthServer.listen(Number(PORT), '0.0.0.0', () => {
+        console.log(`[Railway Web Server] Healthcheck listening on port ${PORT}`);
+      });
+    } catch (srvErr) {
+      console.warn(`[Railway Web Server] Could not start health server: ${srvErr.message}`);
+    }
   }
 }
 

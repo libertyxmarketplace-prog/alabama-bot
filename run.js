@@ -38,13 +38,25 @@ function launch() {
 }
 
 function stopSupervisor(signal) {
+  if (isStopping) return;
   isStopping = true;
+  console.log(`[supervisor] Received ${signal}. Forwarding signal to bot...`);
   if (currentChild) {
     try {
       currentChild.kill(signal);
     } catch {}
+    const forceExitTimeout = setTimeout(() => {
+      console.warn('[supervisor] Bot did not exit within 5s timeout. Terminating supervisor.');
+      process.exit(0);
+    }, 5000);
+    currentChild.once('exit', () => {
+      clearTimeout(forceExitTimeout);
+      console.log('[supervisor] Bot exited cleanly. Terminating supervisor.');
+      process.exit(0);
+    });
+  } else {
+    process.exit(0);
   }
-  process.exit(0);
 }
 
 process.on('SIGINT', () => stopSupervisor('SIGINT'));
