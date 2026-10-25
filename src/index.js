@@ -11251,6 +11251,7 @@ async function updateBotPresence(botClient) {
       activities: [{ name: text, type: ActivityType.Watching }],
       status: 'idle'
     });
+    botClient.user?.setStatus('idle');
   } catch (err) {
     console.warn(`Could not update bot presence: ${err.message}`);
   }
@@ -11404,6 +11405,10 @@ client.once(Events.ClientReady, async (readyClient) => {
   }
 
   console.log(`Logged in as ${readyClient.user.tag}. Bot is ready.`);
+  try {
+    readyClient.user?.setStatus('idle');
+    readyClient.user?.setPresence({ status: 'idle' });
+  } catch {}
   getOutboundIp().then((ip) => {
     console.log(`[ER:LC Bot Outbound IP] ${ip} - Ensure this IP is allowlisted on https://api.erlc.gg/server-owners`);
   }).catch(() => {});
